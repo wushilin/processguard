@@ -1,6 +1,8 @@
-# Place as guard.toml next to the guard binary (or a symlink to it), then:
-#   * * * * * /home/usera/apps/app1/guard
-# Commands run via `sh -c` in this directory, with this directory on PATH.
+# Crontab:
+#   * * * * * /usr/local/bin/guard -c /home/usera/apps/app1/guard.toml
+# Without -c, ./guard.toml in the current directory is used.
+# Commands run via `sh -c` in this file's directory, with that directory on PATH;
+# relative paths below are relative to it too.
 
 app_name = "sleeper"
 
@@ -8,10 +10,16 @@ app_name = "sleeper"
 # Launched detached (nohup-style) and not waited for; may run the app in the foreground.
 # Its output goes to /dev/null unless [logging] names files.
 start = "run.sh"
+# Status check: set exactly one of these two.
 # Exit 0 = running, 1 = not running. Any other code is an error: nothing is started.
 status = "status.sh"
+# Cheaper, no shell: running if this file holds the pid of a live process. The app
+# or its start script must write it (e.g. `echo $$ > app.pid; exec ./app`).
+# status_check_pid_file = "app.pid"
 # Optional. Exit 0 = enabled, otherwise disabled. Omit to always guard.
 enabled = "enabled.sh"
+# Optional, cheaper, no shell: disabled while this file exists (`touch disabled`).
+# disable_file = "disabled"
 # Optional. Run when disabled but still running.
 stop = "stop.sh"
 

@@ -3,22 +3,22 @@
 A cron-driven process guard, for hosts where systemd (or another supervisor) is not an option.
 
 ```
-* * * * * /home/usera/apps/app1/guard
+* * * * * /usr/local/bin/guard -c /home/usera/apps/app1/guard.toml
 ```
 
-Each run reads `guard.toml` next to the binary, starts the app if it is not running, stops it if it
+Each run reads the config, starts the app if it is not running, stops it if it
 has been disabled, rotates its logs, and exits. There is no daemon.
 
 ## Setup
 
 ```sh
 cargo build --release
-cp target/release/processguard /home/usera/apps/app1/guard   # or symlink one shared binary
+cp target/release/processguard /usr/local/bin/guard
 cp guard.toml.example /home/usera/apps/app1/guard.toml
 ```
 
-The config is looked up next to the path the guard was invoked by, so one binary can be symlinked
-into many app directories. A config path can also be passed explicitly: `guard /path/to/guard.toml`.
+The config is given with `-c <file>`; without it, `./guard.toml` in the current directory is used.
+Cron starts jobs in `$HOME`, so a crontab entry needs `-c` (or a `cd`).
 
 ## Configuration
 
@@ -30,7 +30,9 @@ app_name = "sleeper"
 [commands]
 start = "run.sh"        # launch the app
 status = "status.sh"    # exit 0 = running, 1 = not running
+# status_check_pid_file = "app.pid"   # alternative to `status`: no shell, just probes the pid
 enabled = "enabled.sh"  # optional: exit 0 = enabled, otherwise disabled
+# disable_file = "disabled"           # optional: disabled while this file exists; no shell
 stop = "stop.sh"        # optional: run when disabled but still running
 
 [logging]               # optional: without it the app's output goes to /dev/null
@@ -41,7 +43,8 @@ max_keep = 10
 compress_after = 3
 ```
 
-Commands run via `sh -c` in the config's directory, with that directory on `PATH`.
+Commands run via `sh -c` in the config's directory, with that directory on `PATH`; relative paths
+in the config are relative to it as well.
 
 ## Behaviour
 
@@ -52,6 +55,13 @@ Commands run via `sh -c` in the config's directory, with that directory on `PATH
   process tree is killed.
 - **status** exiting with anything other than 0 or 1 (or timing out) is an error: nothing is
   started, because a broken status check should not cause a double start.
+- **status_check_pid_file** replaces the status command with a signal-0 probe of the pid in that
+  file. A missing or empty file, or a dead pid, means not running; unparseable content is an error.
+  The app or its start script writes the file (`echo $$ > app.pid; exec ./app`). A stale pid that
+  the OS has reused for another process reads as running, which a status script can rule out.
+- **disable_file** disables the app while that file exists (`touch disabled`), without a shell.
+  With it and `status_check_pid_file`, a run where nothing needs doing spawns no processes at all
+  and takes about a millisecond; each shell command adds a few milliseconds.
 - A lock file makes overlapping cron runs exit immediately.
 - The guard prints nothing in normal operation (no cron mail); events go to `guard.log`.
 

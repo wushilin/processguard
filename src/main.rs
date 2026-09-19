@@ -1,8 +1,8 @@
 //! processguard: a cron-driven process guard.
 //!
-//! Invoked periodically (e.g. `* * * * * /home/usera/apps/app1/guard`), it reads
-//! `guard.toml` next to itself, and starts the configured process if it is not running
-//! (or stops it if it has been disabled).
+//! Invoked periodically (e.g. `* * * * * /path/guard -c /home/usera/apps/app1/guard.toml`),
+//! it starts the configured process if it is not running (or stops it if it has
+//! been disabled).
 
 use std::env;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -35,9 +35,16 @@ struct Commands {
     /// it may simply run the app in the foreground. Exempt from the timeout.
     start: String,
     /// Exit 0 = running, exit 1 = not running, anything else = error (no action).
-    status: String,
+    /// Exactly one of `status` and `status_check_pid_file` must be set.
+    status: Option<String>,
+    /// Status check without a shell: running if this file holds the pid of a
+    /// live process. The app (or its start script) must write it.
+    status_check_pid_file: Option<String>,
     /// Optional. Exit 0 = enabled, anything else = disabled.
     enabled: Option<String>,
+    /// Optional. Disabled while this file exists; checked without a shell,
+    /// before (and instead of, when it exists) the `enabled` command.
+    disable_file: Option<String>,
     /// Optional. Run when disabled but still running.
     stop: Option<String>,
 }
@@ -271,12 +278,22 @@ impl Guard {
         }
     }
 
+    /// 0 = running, 1 = not running; other codes come from the status command.
+    fn status(&self) -> Result<i32, String> {
+        let commands = &self.config.commands;
+        match (&commands.status, &commands.status_check_pid_file) {
+            (Some(cmd), None) => self.exec(cmd),
+            (None, Some(file)) => pid_file_status(file),
+            _ => Err("exactly one of `status` and `status_check_pid_file` must be set".into()),
+        }
+    }
+
     /// Disabled: stop the process if a stop command is configured and it is running.
     fn stop_if_running(&self) -> Result<(), String> {
         let Some(stop) = &self.config.commands.stop else {
             return Ok(());
         };
-        if self.exec(&self.config.commands.status)? != 0 {
+        if self.status()? != 0 {
             return Ok(());
         }
         match self.exec(stop)? {
@@ -288,13 +305,24 @@ impl Guard {
         }
     }
 
-    fn run(&self) -> Result<(), String> {
-        if let Some(enabled) = &self.config.commands.enabled {
-            if self.exec(enabled)? != 0 {
-                return self.stop_if_running();
+    fn enabled(&self) -> Result<bool, String> {
+        let commands = &self.config.commands;
+        if let Some(file) = &commands.disable_file {
+            if Path::new(file).exists() {
+                return Ok(false);
             }
         }
-        match self.exec(&self.config.commands.status)? {
+        match &commands.enabled {
+            Some(cmd) => Ok(self.exec(cmd)? == 0),
+            None => Ok(true),
+        }
+    }
+
+    fn run(&self) -> Result<(), String> {
+        if !self.enabled()? {
+            return self.stop_if_running();
+        }
+        match self.status()? {
             0 => Ok(()),
             1 => {
                 let pid = self.start()?;
@@ -305,7 +333,7 @@ impl Guard {
                 Ok(())
             }
             code => Err(format!(
-                "status command exited with {code} (expected 0 or 1); not starting"
+                "status check exited with {code} (expected 0 or 1); not starting"
             )),
         }
     }
@@ -314,26 +342,61 @@ impl Guard {
 /// Waits up to `timeout` for the child to exit. None means still running.
 fn wait(child: &mut Child, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
     let deadline = Instant::now() + timeout;
+    // Back off from 1ms: typical checks exit within a few ms, slow ones are
+    // polled at most every 50ms.
+    let mut pause = Duration::from_millis(1);
     loop {
         match child.try_wait()? {
             Some(status) => return Ok(Some(status)),
             None if Instant::now() >= deadline => return Ok(None),
-            None => sleep(Duration::from_millis(50)),
+            None => sleep(pause),
         }
+        pause = (pause * 2).min(Duration::from_millis(50));
     }
 }
 
-/// Config path: first argument if given, otherwise `guard.toml` next to the
-/// binary as invoked (argv[0], so per-app symlinks to one binary work).
-fn config_path() -> PathBuf {
-    if let Some(arg) = env::args_os().nth(1) {
-        return PathBuf::from(arg);
+/// Exit-code-style status from a pid file: 0 if it names a live process, 1 if
+/// the file is missing or empty or the process is gone.
+fn pid_file_status(file: &str) -> Result<i32, String> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(e) => return Err(format!("cannot read {file}: {e}")),
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(1);
     }
-    let argv0 = env::args_os().next().map(PathBuf::from).unwrap_or_default();
-    match argv0.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join("guard.toml"),
-        _ => PathBuf::from("guard.toml"),
+    let pid = match text.parse::<libc::pid_t>() {
+        Ok(pid) if pid > 0 => pid,
+        _ => return Err(format!("{file} does not contain a pid: `{text}`")),
+    };
+    // Signal 0 only probes. EPERM means the process exists under another user.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(0);
     }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Ok(1),
+        Some(libc::EPERM) => Ok(0),
+        _ => Err(format!("cannot probe pid {pid}: {}", std::io::Error::last_os_error())),
+    }
+}
+
+const USAGE: &str = "usage: guard [-c <config.toml>]   (default: ./guard.toml)";
+
+/// Config path from `-c`, otherwise `guard.toml` in the current directory.
+fn config_path() -> Result<PathBuf, String> {
+    let mut path = PathBuf::from("guard.toml");
+    let mut args = env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("-c" | "--config") => {
+                path = args.next().map(PathBuf::from).ok_or(USAGE)?;
+            }
+            _ => return Err(USAGE.to_string()),
+        }
+    }
+    Ok(path)
 }
 
 /// Takes an exclusive lock so overlapping cron runs never do the same work
@@ -349,14 +412,21 @@ fn lock(dir: &Path, name: &str) -> Result<Option<File>, String> {
 }
 
 fn main() -> ExitCode {
-    let path = config_path();
     let setup = || -> Result<Guard, String> {
+        let path = config_path()?;
         let path = path
             .canonicalize()
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let config: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let commands = &config.commands;
+        if commands.status.is_some() == commands.status_check_pid_file.is_some() {
+            return Err(format!(
+                "{}: exactly one of `status` and `status_check_pid_file` must be set",
+                path.display()
+            ));
+        }
         let dir = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         env::set_current_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         Ok(Guard { config, dir })

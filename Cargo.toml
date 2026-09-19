@@ -9,3 +9,11 @@ flate2 = "1.1.10"
 libc = "0.2.189"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.6"
+
+# The guard runs every minute: keep the binary small and quick to load.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
