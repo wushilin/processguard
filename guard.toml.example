@@ -1,0 +1,31 @@
+# Place as guard.toml next to the guard binary (or a symlink to it), then:
+#   * * * * * /home/usera/apps/app1/guard
+# Commands run via `sh -c` in this directory, with this directory on PATH.
+
+app_name = "sleeper"
+
+[commands]
+# Launched detached (nohup-style) and not waited for; may run the app in the foreground.
+# Its output goes to /dev/null unless [logging] names files.
+start = "run.sh"
+# Exit 0 = running, 1 = not running. Any other code is an error: nothing is started.
+status = "status.sh"
+# Optional. Exit 0 = enabled, otherwise disabled. Omit to always guard.
+enabled = "enabled.sh"
+# Optional. Run when disabled but still running.
+stop = "stop.sh"
+
+# Optional; defaults shown.
+[options]
+timeout_secs = 30        # enabled/status/stop are killed (whole tree) after this
+log = "guard.log"        # guard's own log; written only when something happens
+
+# Optional. Without stdout/stderr here, the app's output is discarded.
+# Files are checked on every guard run, so they can overshoot max_size by up to
+# one cron interval of output (more while a previous run is still compressing).
+[logging]
+stdout = "stdout.log"
+stderr = "stderr.log"    # may be the same file as stdout
+max_size = "15MiB"       # rotate at this size; default 10MiB. Bytes, or K/M/G, KiB/MiB/GiB, KB/MB/GB
+max_keep = 10            # keep stdout.log.1 .. stdout.log.10; default 10
+compress_after = 3       # stdout.log.4 and older are gzipped (stdout.log.4.gz); default 3

@@ -1,0 +1,11 @@
+[package]
+name = "processguard"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+flate2 = "1.1.10"
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.6"
