@@ -1,82 +1,183 @@
 # processguard
 
-A cron-driven process guard, for hosts where systemd (or another supervisor) is not an option.
+A cron-driven, convention-based supervisor for hosts where a resident service
+manager is unavailable.
 
+```cron
+* * * * * /usr/local/bin/processguard -c /etc/processguard/guard.toml
 ```
-* * * * * /usr/local/bin/guard -c /home/usera/apps/app1/guard.toml
+
+One invocation discovers applications, checks all of them concurrently, rotates
+their logs, and exits. A lock prevents overlapping cron invocations.
+
+## Drop-in layout
+
+Every visible immediate directory under `base_dir` is an application:
+
+```text
+apps/
+├── api/
+│   ├── run.sh
+│   ├── healthcheck.sh
+│   ├── log.conf
+│   └── logs/
+└── worker/
+    └── run.sh
 ```
 
-Each run reads the config, starts the app if it is not running, stops it if it
-has been disabled, rotates its logs, and exits. There is no daemon.
-
-## Setup
+Hidden directories are ignored, which permits atomic deployments:
 
 ```sh
-cargo build --release
-cp target/release/processguard /usr/local/bin/guard
-cp guard.toml.example /home/usera/apps/app1/guard.toml
+mv apps/.deploying-api apps/api
 ```
 
-The config is given with `-c <file>`; without it, `./guard.toml` in the current directory is used.
-Cron starts jobs in `$HOME`, so a crontab entry needs `-c` (or a `cd`).
+The only required application file is executable `run.sh`. It must remain in
+the foreground and ultimately `exec` the real application. Processguard starts
+it in a new session and owns the PID file.
 
 ## Configuration
 
-See [guard.toml.example](guard.toml.example) for every option.
+The minimal configuration contains no `[[app]]` entries:
 
 ```toml
-app_name = "sleeper"
+[global]
+base_dir = "/home/abc/processguard/apps"
+```
 
-[commands]
-start = "run.sh"        # launch the app
-status = "status.sh"    # exit 0 = running, 1 = not running
-# status_check_pid_file = "app.pid"   # alternative to `status`: no shell, just probes the pid
-enabled = "enabled.sh"  # optional: exit 0 = enabled, otherwise disabled
-# disable_file = "disabled"           # optional: disabled while this file exists; no shell
-stop = "stop.sh"        # optional: run when disabled but still running
+Defaults:
 
-[logging]               # optional: without it the app's output goes to /dev/null
-stdout = "stdout.log"
-stderr = "stderr.log"
+```toml
+[global]
+startup_validation_secs = 10
+stop_grace_secs = 30
+timeout_secs = 30
+guard_log = "guard.log"
+
+[global.log]
+stdout = "logs/stdout.log"
+stderr = "logs/stderr.log"
 max_size = "15MiB"
 max_keep = 10
 compress_after = 3
+compression = "gzip"
 ```
 
-Commands run via `sh -c` in the config's directory, with that directory on `PATH`; relative paths
-in the config are relative to it as well.
+An optional `[[app]]` section overrides conventions for a discovered directory;
+it does not register an application:
 
-## Behaviour
+```toml
+[[app]]
+name = "api"
+healthcheck = "./healthcheck.sh"
+startup_validation_secs = 20
 
-- **start** is launched detached, nohup-style (own session, SIGHUP ignored), and not waited for,
-  so the script can simply run the app in the foreground. A non-zero exit within the first second
-  is logged as a failed start.
-- **enabled**, **status** and **stop** must exit within `timeout_secs` (default 30), or their whole
-  process tree is killed.
-- **status** exiting with anything other than 0 or 1 (or timing out) is an error: nothing is
-  started, because a broken status check should not cause a double start.
-- **status_check_pid_file** replaces the status command with a signal-0 probe of the pid in that
-  file. A missing or empty file, or a dead pid, means not running; unparseable content is an error.
-  The app or its start script writes the file (`echo $$ > app.pid; exec ./app`). A stale pid that
-  the OS has reused for another process reads as running, which a status script can rule out.
-- **disable_file** disables the app while that file exists (`touch disabled`), without a shell.
-  With it and `status_check_pid_file`, a run where nothing needs doing spawns no processes at all
-  and takes about a millisecond; each shell command adds a few milliseconds.
-- A lock file makes overlapping cron runs exit immediately.
-- The guard prints nothing in normal operation (no cron mail); events go to `guard.log`.
+[app.log]
+max_keep = 5
 
-### Log rotation
+[[app]]
+name = "manually-managed"
+managed = false
+```
 
-Log files are checked on every run and rotated once they reach `max_size`: `stdout.log` →
-`stdout.log.1` → … → `stdout.log.<max_keep>`, with generations past `compress_after` gzipped
-(`stdout.log.4.gz`).
+An override without a matching directory is an error. Duplicate names, path
+components as names, and symlinks resolving outside `base_dir` are rejected.
 
-- The app keeps its log open, so the live file is copied and then truncated in place. Lines written
-  in the instant between the copy and the truncate can be lost.
-- Files can overshoot `max_size` by up to one cron interval of output.
-- Rotation runs under its own lock, after the process check. If compression outlasts the cron
-  interval, later runs keep guarding the process and skip rotation until it finishes.
+Configuration precedence is:
 
-## Building on FreeBSD without cc/ld (pfSense)
+```text
+built-in conventions
+  < [global] and [global.log]
+  < matching [[app]] and [app.log]
+  < <app-directory>/log.conf
+```
 
-`./build-freebsd.sh` links with the `rust-lld` bundled in the rust package, via `freebsd-link.sh`.
+See [guard.toml.example](guard.toml.example) and
+[log.conf.example](log.conf.example).
+
+## Application conventions
+
+For `<base_dir>/api`, processguard uses:
+
+| Purpose | Default |
+|---|---|
+| Start program | `./run.sh` |
+| PID record | `./app.pid` |
+| Disable marker | `./disabled` |
+| Invalid marker | `./invalid` |
+| Optional stop program | `./stop.sh` |
+| Optional stop signal | `./signal` |
+| Optional log settings | `./log.conf` |
+| Standard output | `./logs/stdout.log` |
+| Standard error | `./logs/stderr.log` |
+
+The PID record is TOML and contains both the leader PID and process-group ID.
+Legacy files containing one numeric PID are also accepted.
+
+## Startup quarantine
+
+After spawning `run.sh`, processguard writes `app.pid` atomically and observes
+the child for `startup_validation_secs`. Any exit during that window, including
+a successful exit, means the foreground/exec contract was broken.
+
+The process group is killed, the PID file is removed, and an `invalid` TOML
+marker records the timestamp, reason, PID, observation duration, and exit
+status. While `invalid` exists, the application is not inspected, launched,
+stopped, health-checked, or rotated. Remove the marker after fixing the app.
+
+Creating an invalid marker makes that invocation fail. Subsequent invocations
+treat the quarantined application as intentionally skipped.
+
+## Stopping
+
+When `disabled` exists, or a configured health check reports unhealthy:
+
+1. If `stop.sh` exists, processguard runs it.
+2. Otherwise it reads `signal`; missing `signal` defaults to `TERM`.
+3. `TERM`, `INT`, `HUP`, and `QUIT` are sent to the leader PID.
+4. Processguard waits up to `stop_grace_secs` for both the leader and process
+   group to disappear.
+5. Survivors receive `SIGKILL` as an entire process group.
+
+If `stop.sh` fails or times out, processguard also uses the configured signal
+before beginning the grace period.
+
+Setting `signal` to `KILL` skips the grace period and immediately kills the
+entire process group. Signal names may optionally include the `SIG` prefix.
+
+If the leader exits while its process group remains during an ordinary check,
+the remaining group is killed and the application is quarantined as an
+orphaned process group.
+
+## Health checks
+
+Health checks are opt-in through an app override:
+
+```toml
+[[app]]
+name = "api"
+healthcheck = "./healthcheck.sh"
+```
+
+Exit 0 means healthy, exit 1 means unhealthy, and other outcomes are errors. An
+unhealthy app follows the normal stop procedure and then undergoes the complete
+startup-validation procedure again.
+
+## Concurrency and logs
+
+Lifecycle checks use one scoped worker per discovered app. A ten-second startup
+validation therefore costs roughly ten seconds for any number of apps started
+in the same pass, rather than ten seconds per app.
+
+Rotation runs after workers join and remains serial under its own lock to avoid
+saturating storage with concurrent compression. Compression can be `gzip` or
+`none`.
+
+## Building
+
+```sh
+cargo build --release
+cp target/release/processguard /usr/local/bin/processguard
+```
+
+On FreeBSD systems without `cc`/`ld`, `./build-freebsd.sh` uses the bundled
+`rust-lld` through `freebsd-link.sh`.

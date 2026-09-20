@@ -1,0 +1,8 @@
+# Place as <app-directory>/log.conf. These values override both [global.log]
+# and a matching [app.log] section.
+stdout = "logs/stdout.log"
+stderr = "logs/stderr.log"
+max_size = "15MiB"
+max_keep = 10
+compress_after = 3
+compression = "gzip" # gzip or none

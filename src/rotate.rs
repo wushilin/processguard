@@ -16,6 +16,14 @@ pub struct Policy {
     pub max_size: u64,
     pub max_keep: u32,
     pub compress_after: u32,
+    pub compression: CompressionMethod,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionMethod {
+    Gzip,
+    None,
 }
 
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
@@ -70,9 +78,13 @@ pub fn rotate(live: &Path, policy: &Policy) -> io::Result<Option<u64>> {
     let compressed = |n: u32| suffixed(live, &format!(".{n}.gz"));
 
     // Finish compression left over from an interrupted run.
-    for n in (policy.compress_after + 1)..=policy.max_keep {
-        if generation(n).exists() {
-            gzip(&generation(n), &compressed(n))?;
+    if policy.compression == CompressionMethod::Gzip
+        && let Some(first_compressed) = policy.compress_after.checked_add(1)
+    {
+        for n in first_compressed..=policy.max_keep {
+            if generation(n).exists() {
+                gzip(&generation(n), &compressed(n))?;
+            }
         }
     }
 
@@ -100,10 +112,77 @@ pub fn rotate(live: &Path, policy: &Policy) -> io::Result<Option<u64>> {
     copy_truncate(live, &generation(1))?;
 
     // The slow part, done last: the generation that just crossed compress_after.
-    for n in (policy.compress_after + 1)..=policy.max_keep {
-        if generation(n).exists() {
-            gzip(&generation(n), &compressed(n))?;
+    if policy.compression == CompressionMethod::Gzip
+        && let Some(first_compressed) = policy.compress_after.checked_add(1)
+    {
+        for n in first_compressed..=policy.max_keep {
+            if generation(n).exists() {
+                gzip(&generation(n), &compressed(n))?;
+            }
         }
     }
     Ok(Some(size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "processguard-rotate-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn compression_none_keeps_plain_generations() {
+        let test_dir = TestDir::new();
+        let live = test_dir.0.join("stdout.log");
+        fs::write(&live, b"output").expect("write live log");
+        let policy = Policy {
+            max_size: 1,
+            max_keep: 2,
+            compress_after: 0,
+            compression: CompressionMethod::None,
+        };
+
+        assert_eq!(rotate(&live, &policy).expect("rotate"), Some(6));
+        assert!(test_dir.0.join("stdout.log.1").exists());
+        assert!(!test_dir.0.join("stdout.log.1.gz").exists());
+    }
+
+    #[test]
+    fn gzip_compresses_generations_after_threshold() {
+        let test_dir = TestDir::new();
+        let live = test_dir.0.join("stdout.log");
+        fs::write(&live, b"output").expect("write live log");
+        let policy = Policy {
+            max_size: 1,
+            max_keep: 2,
+            compress_after: 0,
+            compression: CompressionMethod::Gzip,
+        };
+
+        assert_eq!(rotate(&live, &policy).expect("rotate"), Some(6));
+        assert!(!test_dir.0.join("stdout.log.1").exists());
+        assert!(test_dir.0.join("stdout.log.1.gz").exists());
+    }
 }

@@ -1,39 +1,31 @@
-# Crontab:
-#   * * * * * /usr/local/bin/guard -c /home/usera/apps/app1/guard.toml
-# Without -c, ./guard.toml in the current directory is used.
-# Commands run via `sh -c` in this file's directory, with that directory on PATH;
-# relative paths below are relative to it too.
+# Every visible immediate subdirectory of base_dir is discovered automatically.
+# No [[app]] section is required for applications that follow the conventions.
 
-app_name = "sleeper"
+[global]
+base_dir = "/home/abc/processguard/apps"
+startup_validation_secs = 10
+stop_grace_secs = 30
+timeout_secs = 30
+guard_log = "guard.log"
 
-[commands]
-# Launched detached (nohup-style) and not waited for; may run the app in the foreground.
-# Its output goes to /dev/null unless [logging] names files.
-start = "run.sh"
-# Status check: set exactly one of these two.
-# Exit 0 = running, 1 = not running. Any other code is an error: nothing is started.
-status = "status.sh"
-# Cheaper, no shell: running if this file holds the pid of a live process. The app
-# or its start script must write it (e.g. `echo $$ > app.pid; exec ./app`).
-# status_check_pid_file = "app.pid"
-# Optional. Exit 0 = enabled, otherwise disabled. Omit to always guard.
-enabled = "enabled.sh"
-# Optional, cheaper, no shell: disabled while this file exists (`touch disabled`).
-# disable_file = "disabled"
-# Optional. Run when disabled but still running.
-stop = "stop.sh"
+[global.log]
+stdout = "logs/stdout.log"
+stderr = "logs/stderr.log"
+max_size = "15MiB"
+max_keep = 10
+compress_after = 3
+compression = "gzip"
 
-# Optional; defaults shown.
-[options]
-timeout_secs = 30        # enabled/status/stop are killed (whole tree) after this
-log = "guard.log"        # guard's own log; written only when something happens
-
-# Optional. Without stdout/stderr here, the app's output is discarded.
-# Files are checked on every guard run, so they can overshoot max_size by up to
-# one cron interval of output (more while a previous run is still compressing).
-[logging]
-stdout = "stdout.log"
-stderr = "stderr.log"    # may be the same file as stdout
-max_size = "15MiB"       # rotate at this size; default 10MiB. Bytes, or K/M/G, KiB/MiB/GiB, KB/MB/GB
-max_keep = 10            # keep stdout.log.1 .. stdout.log.10; default 10
-compress_after = 3       # stdout.log.4 and older are gzipped (stdout.log.4.gz); default 3
+# Add a section only when an application needs an override.
+#
+# [[app]]
+# name = "api"
+# healthcheck = "./healthcheck.sh"
+# startup_validation_secs = 20
+#
+# [app.log]
+# max_keep = 5
+#
+# [[app]]
+# name = "manually-managed"
+# managed = false
