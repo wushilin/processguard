@@ -60,6 +60,7 @@ max_size = "15MiB"
 max_keep = 10
 compress_after = 3
 compression = "gzip"
+rotation = "copytruncate"
 ```
 
 An optional `[[app]]` section overrides conventions for a discovered directory;
@@ -104,6 +105,7 @@ For `<base_dir>/api`, processguard uses:
 | PID record | `./app.pid` |
 | Disable marker | `./disabled` |
 | Invalid marker | `./invalid` |
+| Suspended marker (transient) | `./suspended` |
 | Optional stop program | `./stop.sh` |
 | Optional stop signal | `./signal` |
 | Optional log settings | `./log.conf` |
@@ -171,6 +173,38 @@ in the same pass, rather than ten seconds per app.
 Rotation runs after workers join and remains serial under its own lock to avoid
 saturating storage with concurrent compression. Compression can be `gzip` or
 `none`.
+
+### Lossless rotation
+
+The app keeps its log open, so the live file is copied to `<file>.1` and then
+truncated in place. With the default `rotation = "copytruncate"`, output written
+in the instant between the end of the copy and the truncate is lost: nothing
+measurable for a quiet app, but about one `write()` per rotation for an app
+that logs flat out.
+
+`rotation = "suspend"` closes that window. The bulk of the file is copied while
+the app runs; then the app's whole process group is stopped with `SIGSTOP`, the
+remainder is copied, the file is truncated, and the group is resumed with
+`SIGCONT`. A stopped process cannot write, and output still buffered inside the
+app is frozen with it and lands in the fresh file afterwards, so nothing is
+lost. The pause covers only the final copy and the truncate: typically around a
+millisecond, and logged with every rotation.
+
+```toml
+[global.log]            # or [app.log], or <app>/log.conf
+rotation = "suspend"
+```
+
+- Only the app's process group is stopped. A process that holds the log open
+  from outside the group (one that called `setsid`) is not covered.
+- If the group cannot be confirmed stopped within a second, it is resumed and
+  the file is rotated as with `copytruncate`; the guard log says so.
+- While the app is stopped, a `suspended` marker names its process group. If the
+  guard dies before resuming it, the next run resumes the group and removes the
+  marker, so an app is never left frozen for longer than a cron interval.
+- `SIGSTOP`/`SIGCONT` make some blocking system calls return `EINTR`. Language
+  runtimes retry these transparently; hence this is opt-in rather than default.
+- Supported on Linux, FreeBSD and macOS; elsewhere it behaves as `copytruncate`.
 
 ## Building
 

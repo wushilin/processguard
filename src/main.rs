@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 mod rotate;
+mod suspend;
 
 const FORCE_KILL_WAIT: Duration = Duration::from_secs(5);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -61,6 +62,7 @@ struct LogSettings {
     max_keep: u32,
     compress_after: u32,
     compression: rotate::CompressionMethod,
+    rotation: rotate::RotationMethod,
 }
 
 impl Default for LogSettings {
@@ -72,6 +74,7 @@ impl Default for LogSettings {
             max_keep: 10,
             compress_after: 3,
             compression: rotate::CompressionMethod::Gzip,
+            rotation: rotate::RotationMethod::CopyTruncate,
         }
     }
 }
@@ -86,6 +89,7 @@ struct LogOverrides {
     max_keep: Option<u32>,
     compress_after: Option<u32>,
     compression: Option<rotate::CompressionMethod>,
+    rotation: Option<rotate::RotationMethod>,
 }
 
 impl LogOverrides {
@@ -107,6 +111,9 @@ impl LogOverrides {
         }
         if let Some(value) = self.compression {
             settings.compression = value;
+        }
+        if let Some(value) = self.rotation {
+            settings.rotation = value;
         }
     }
 }
@@ -767,7 +774,34 @@ impl Supervisor<'_> {
         }
     }
 
+    fn suspended_path(&self) -> PathBuf {
+        self.app.dir.join("suspended")
+    }
+
+    /// The writers to stop while truncating: the running app's process group.
+    fn suspend_target(&self, settings: &LogSettings) -> Option<suspend::Suspend> {
+        if settings.rotation != rotate::RotationMethod::Suspend {
+            return None;
+        }
+        match self.current_state() {
+            Ok((ProcessState::Running, Some(record))) => Some(suspend::Suspend {
+                process_group: record.process_group,
+                marker: self.suspended_path(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Must run under the rotation lock, which the caller holds.
     fn rotate_logs(&self) {
+        // A guard that died mid-rotation may have left the app stopped.
+        match suspend::recover(&self.suspended_path()) {
+            Ok(Some(group)) => self.log(&format!(
+                "resumed process group {group} left suspended by an interrupted rotation"
+            )),
+            Ok(None) => {}
+            Err(e) => self.log(&format!("error: checking suspended marker: {e}")),
+        }
         if !self.app.managed {
             return;
         }
@@ -792,9 +826,25 @@ impl Supervisor<'_> {
             compress_after: settings.compress_after,
             compression: settings.compression,
         };
+        let suspend = self.suspend_target(&settings);
         for file in files {
-            match rotate::rotate(&file, &policy) {
-                Ok(Some(size)) => self.log(&format!("rotated {} ({size} bytes)", file.display())),
+            match rotate::rotate(&file, &policy, suspend.as_ref()) {
+                Ok(Some(rotated)) => {
+                    let how = match rotated.truncation {
+                        rotate::Truncation::Plain => String::new(),
+                        rotate::Truncation::Suspended(pause) => {
+                            format!(", app suspended for {:.2}ms", pause.as_secs_f64() * 1e3)
+                        }
+                        rotate::Truncation::SuspendFailed => {
+                            ", could not suspend the app: truncated without it".to_string()
+                        }
+                    };
+                    self.log(&format!(
+                        "rotated {} ({} bytes{how})",
+                        file.display(),
+                        rotated.size
+                    ));
+                }
                 Ok(None) => {}
                 Err(e) => self.log(&format!("error: rotating {}: {e}", file.display())),
             }

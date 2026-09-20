@@ -1,22 +1,53 @@
 //! Size-based rotation of the app's stdout/stderr files.
 //!
 //! The app holds the live file open (O_APPEND), so it cannot be renamed away;
-//! it is copied to `<file>.1` and truncated in place. Older generations shift
+//! it is copied to `<file>.1` and truncated in place, optionally with the app
+//! suspended for the final step so nothing is lost. Older generations shift
 //! up (`.1` -> `.2` ...), those past `compress_after` are gzipped, and those
 //! past `max_keep` are deleted.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
+
+use crate::suspend::Suspend;
 
 pub struct Policy {
     pub max_size: u64,
     pub max_keep: u32,
     pub compress_after: u32,
     pub compression: CompressionMethod,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RotationMethod {
+    /// Copy, then truncate. Output written in the instant between the two is lost.
+    #[default]
+    CopyTruncate,
+    /// As above, with the app's process group stopped across the final copy
+    /// and the truncate, so nothing is lost.
+    Suspend,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct Rotated {
+    pub size: u64,
+    pub truncation: Truncation,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum Truncation {
+    /// No suspension was requested (or nothing is kept, so nothing can be lost).
+    Plain,
+    /// The app was suspended for this long.
+    Suspended(Duration),
+    /// Suspension was requested but the group could not be confirmed stopped.
+    SuspendFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
@@ -46,17 +77,36 @@ fn rename(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-/// Copies the live file to `dest`, then truncates it in place. Writes landing
-/// between the final read and the truncate are lost; the tail pass keeps that
-/// window as small as possible.
-fn copy_truncate(live: &Path, dest: &Path) -> io::Result<()> {
+/// Copies the live file to `dest`, then truncates it in place.
+///
+/// Without `suspend`, writes landing between the final read and the truncate
+/// are lost; the tail pass keeps that window as small as possible. With it,
+/// the writers are stopped for the tail pass and the truncate. The bulk copy
+/// and the fsync, which are slow, happen while the app still runs.
+fn copy_truncate(live: &Path, dest: &Path, suspend: Option<&Suspend>) -> io::Result<Truncation> {
     let mut src = File::open(live)?;
     let truncate = OpenOptions::new().write(true).open(live)?;
     let mut dst = File::create(dest)?;
     io::copy(&mut src, &mut dst)?;
     dst.sync_all()?;
+
+    let frozen = match suspend {
+        Some(suspend) => suspend.freeze()?,
+        None => None,
+    };
+    // Twice: a write that was already inside the kernel when its thread was
+    // told to stop completes right after the first pass.
     io::copy(&mut src, &mut dst)?;
-    truncate.set_len(0)
+    io::copy(&mut src, &mut dst)?;
+    truncate.set_len(0)?;
+    let truncation = match (&frozen, suspend) {
+        (Some(frozen), _) => Truncation::Suspended(frozen.elapsed()),
+        (None, Some(_)) => Truncation::SuspendFailed,
+        (None, None) => Truncation::Plain,
+    };
+    drop(frozen);
+    dst.sync_all()?;
+    Ok(truncation)
 }
 
 fn gzip(src: &Path, dest: &Path) -> io::Result<()> {
@@ -69,11 +119,16 @@ fn gzip(src: &Path, dest: &Path) -> io::Result<()> {
     fs::remove_file(src)
 }
 
-/// Rotates `live` if it has reached `max_size`. Returns the rotated size.
+/// Rotates `live` if it has reached `max_size`. `suspend` names the writers to
+/// stop while truncating, for lossless rotation.
 ///
 /// Compression can take longer than a cron interval; the caller must hold the
 /// rotation lock, and the live file is allowed to outgrow `max_size` meanwhile.
-pub fn rotate(live: &Path, policy: &Policy) -> io::Result<Option<u64>> {
+pub fn rotate(
+    live: &Path,
+    policy: &Policy,
+    suspend: Option<&Suspend>,
+) -> io::Result<Option<Rotated>> {
     let generation = |n: u32| suffixed(live, &format!(".{n}"));
     let compressed = |n: u32| suffixed(live, &format!(".{n}.gz"));
 
@@ -99,7 +154,10 @@ pub fn rotate(live: &Path, policy: &Policy) -> io::Result<Option<u64>> {
 
     if policy.max_keep == 0 {
         OpenOptions::new().write(true).open(live)?.set_len(0)?;
-        return Ok(Some(size));
+        return Ok(Some(Rotated {
+            size,
+            truncation: Truncation::Plain,
+        }));
     }
 
     // Shift by rename only, so the live file is truncated as soon as possible.
@@ -109,7 +167,7 @@ pub fn rotate(live: &Path, policy: &Policy) -> io::Result<Option<u64>> {
         rename(&generation(n), &generation(n + 1))?;
         rename(&compressed(n), &compressed(n + 1))?;
     }
-    copy_truncate(live, &generation(1))?;
+    let truncation = copy_truncate(live, &generation(1), suspend)?;
 
     // The slow part, done last: the generation that just crossed compress_after.
     if policy.compression == CompressionMethod::Gzip
@@ -121,7 +179,7 @@ pub fn rotate(live: &Path, policy: &Policy) -> io::Result<Option<u64>> {
             }
         }
     }
-    Ok(Some(size))
+    Ok(Some(Rotated { size, truncation }))
 }
 
 #[cfg(test)]
@@ -164,7 +222,14 @@ mod tests {
             compression: CompressionMethod::None,
         };
 
-        assert_eq!(rotate(&live, &policy).expect("rotate"), Some(6));
+        let rotated = rotate(&live, &policy, None).expect("rotate");
+        assert_eq!(
+            rotated,
+            Some(Rotated {
+                size: 6,
+                truncation: Truncation::Plain
+            })
+        );
         assert!(test_dir.0.join("stdout.log.1").exists());
         assert!(!test_dir.0.join("stdout.log.1.gz").exists());
     }
@@ -181,7 +246,14 @@ mod tests {
             compression: CompressionMethod::Gzip,
         };
 
-        assert_eq!(rotate(&live, &policy).expect("rotate"), Some(6));
+        let rotated = rotate(&live, &policy, None).expect("rotate");
+        assert_eq!(
+            rotated,
+            Some(Rotated {
+                size: 6,
+                truncation: Truncation::Plain
+            })
+        );
         assert!(!test_dir.0.join("stdout.log.1").exists());
         assert!(test_dir.0.join("stdout.log.1.gz").exists());
     }

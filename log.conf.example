@@ -6,3 +6,4 @@ max_size = "15MiB"
 max_keep = 10
 compress_after = 3
 compression = "gzip" # gzip or none
+rotation = "copytruncate" # or suspend: pause the app ~1ms per rotation, lose nothing
